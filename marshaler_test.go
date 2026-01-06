@@ -3,6 +3,7 @@ package toml_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -16,9 +17,16 @@ import (
 	"github.com/pelletier/go-toml/v2/internal/assert"
 )
 
+type commenter string
+
+func (c *commenter) TomlComment() string {
+	return string(*c) + ": this is some comment"
+}
+
 type marshalTextKey struct {
 	A string
 	B string
+	C commenter
 }
 
 func (k marshalTextKey) MarshalText() ([]byte, error) {
@@ -28,7 +36,7 @@ func (k marshalTextKey) MarshalText() ([]byte, error) {
 type marshalBadTextKey struct{}
 
 func (k marshalBadTextKey) MarshalText() ([]byte, error) {
-	return nil, fmt.Errorf("error")
+	return nil, errors.New("error")
 }
 
 func toFloat(x interface{}) float64 {
@@ -44,6 +52,7 @@ func toFloat(x interface{}) float64 {
 }
 
 func inDelta(t *testing.T, expected, actual interface{}, delta float64) {
+	t.Helper()
 	dt := toFloat(expected) - toFloat(actual)
 	assert.True(t,
 		dt < -delta && dt < delta,
@@ -137,9 +146,9 @@ a = 'test'
 		{
 			desc: `map with text key`,
 			v: map[marshalTextKey]string{
-				{A: "a", B: "1"}: "value 1",
-				{A: "a", B: "2"}: "value 2",
-				{A: "b", B: "1"}: "value 3",
+				{A: "a", B: "1", C: "value 1 2 3 4"}: "value 1",
+				{A: "a", B: "2"}:                     "value 2",
+				{A: "b", B: "1"}:                     "value 3",
 			},
 			expected: `a-1 = 'value 1'
 a-2 = 'value 2'
@@ -942,7 +951,6 @@ nan = nan
 	assert.Equal(t, expected, string(actual))
 }
 
-//nolint:funlen
 func TestMarshalIndentTables(t *testing.T) {
 	examples := []struct {
 		desc     string
@@ -1011,7 +1019,7 @@ type customTextMarshaler struct {
 
 func (c *customTextMarshaler) MarshalText() ([]byte, error) {
 	if c.value == 1 {
-		return nil, fmt.Errorf("cannot represent 1 because this is a silly test")
+		return nil, errors.New("cannot represent 1 because this is a silly test")
 	}
 	return []byte(fmt.Sprintf("::%d", c.value)), nil
 }
@@ -1051,7 +1059,7 @@ func TestMarshalTextMarshaler(t *testing.T) {
 type brokenWriter struct{}
 
 func (b *brokenWriter) Write([]byte) (int, error) {
-	return 0, fmt.Errorf("dead")
+	return 0, errors.New("dead")
 }
 
 func TestEncodeToBrokenWriter(t *testing.T) {
@@ -1074,10 +1082,10 @@ func TestEncoderSetIndentSymbol(t *testing.T) {
 	assert.Equal(t, expected, w.String())
 }
 
-func TestEncoderSetMarshalJsonNumbers(t *testing.T) {
+func TestEncoderSetMarshalJSONNumbers(t *testing.T) {
 	var w strings.Builder
 	enc := toml.NewEncoder(&w)
-	enc.SetMarshalJsonNumbers(true)
+	enc.SetMarshalJSONNumbers(true)
 	err := enc.Encode(map[string]interface{}{
 		"A": json.Number("1.1"),
 		"B": json.Number("42e-3"),
@@ -1194,11 +1202,291 @@ IP = '192.168.178.35'
 	assert.Equal(t, expected, string(b))
 }
 
+// customZeroType has a custom IsZero method that returns true
+// when Value is less than 10.
+type customZeroType struct {
+	Value int
+}
+
+func (c customZeroType) IsZero() bool {
+	return c.Value < 10
+}
+
+// customZeroPointerType has a custom IsZero method on the pointer receiver.
+type customZeroPointerType struct {
+	Value int
+}
+
+func (c *customZeroPointerType) IsZero() bool {
+	return c.Value < 10
+}
+
+func TestEncoderOmitzeroCustomIsZero(t *testing.T) {
+	type doc struct {
+		Custom customZeroType `toml:",omitzero"`
+		Normal int            `toml:",omitzero"`
+	}
+
+	// Custom.Value = 5, which is < 10, so custom IsZero returns true
+	d := doc{
+		Custom: customZeroType{Value: 5},
+		Normal: 0,
+	}
+
+	b, err := toml.Marshal(d)
+	assert.NoError(t, err)
+
+	// Both fields should be omitted: Custom because custom IsZero returns true,
+	// Normal because its reflect zero value is true.
+	expected := ``
+
+	assert.Equal(t, expected, string(b))
+}
+
+func TestEncoderOmitzeroCustomIsZeroNotZero(t *testing.T) {
+	type doc struct {
+		Custom customZeroType `toml:",omitzero"`
+		Normal int            `toml:",omitzero"`
+	}
+
+	// Custom.Value = 15, which is >= 10, so custom IsZero returns false
+	d := doc{
+		Custom: customZeroType{Value: 15},
+		Normal: 42,
+	}
+
+	b, err := toml.Marshal(d)
+	assert.NoError(t, err)
+
+	// Both fields should be present
+	expected := `Normal = 42
+
+[Custom]
+Value = 15
+`
+
+	assert.Equal(t, expected, string(b))
+}
+
+func TestEncoderOmitzeroCustomIsZeroPointerReceiver(t *testing.T) {
+	type doc struct {
+		Custom customZeroPointerType `toml:",omitzero"`
+	}
+
+	// Custom.Value = 5, which is < 10, so custom IsZero returns true
+	d := doc{
+		Custom: customZeroPointerType{Value: 5},
+	}
+
+	b, err := toml.Marshal(d)
+	assert.NoError(t, err)
+
+	// Field should be omitted because custom IsZero returns true
+	expected := ``
+
+	assert.Equal(t, expected, string(b))
+}
+
+func TestEncoderOmitzeroCustomIsZeroPointerReceiverNotZero(t *testing.T) {
+	type doc struct {
+		Custom customZeroPointerType `toml:",omitzero"`
+	}
+
+	// Custom.Value = 15, which is >= 10, so custom IsZero returns false
+	d := doc{
+		Custom: customZeroPointerType{Value: 15},
+	}
+
+	b, err := toml.Marshal(d)
+	assert.NoError(t, err)
+
+	// Field should be present
+	expected := `[Custom]
+Value = 15
+`
+
+	assert.Equal(t, expected, string(b))
+}
+
+// TestEncoderOmitzeroCustomIsZeroPointerReceiverAddressable tests the v.CanAddr() path
+// by marshaling a pointer to a struct, which makes fields addressable.
+func TestEncoderOmitzeroCustomIsZeroPointerReceiverAddressable(t *testing.T) {
+	type doc struct {
+		Custom customZeroPointerType `toml:",omitzero"`
+	}
+
+	// Custom.Value = 5, which is < 10, so custom IsZero returns true
+	d := &doc{
+		Custom: customZeroPointerType{Value: 5},
+	}
+
+	b, err := toml.Marshal(d)
+	assert.NoError(t, err)
+
+	// Field should be omitted because custom IsZero returns true
+	expected := ``
+
+	assert.Equal(t, expected, string(b))
+}
+
+// TestEncoderOmitzeroCustomIsZeroPointerReceiverAddressableNotZero tests the v.CanAddr() path
+// when custom IsZero returns false.
+func TestEncoderOmitzeroCustomIsZeroPointerReceiverAddressableNotZero(t *testing.T) {
+	type doc struct {
+		Custom customZeroPointerType `toml:",omitzero"`
+	}
+
+	// Custom.Value = 15, which is >= 10, so custom IsZero returns false
+	d := &doc{
+		Custom: customZeroPointerType{Value: 15},
+	}
+
+	b, err := toml.Marshal(d)
+	assert.NoError(t, err)
+
+	// Field should be present
+	expected := `[Custom]
+Value = 15
+`
+
+	assert.Equal(t, expected, string(b))
+}
+
+// TestEncoderOmitzeroCustomIsZeroInlineTable tests omitzero with inline tables.
+func TestEncoderOmitzeroCustomIsZeroInlineTable(t *testing.T) {
+	type doc struct {
+		Custom customZeroType `toml:",omitzero,inline"`
+	}
+
+	// Custom.Value = 5, which is < 10, so custom IsZero returns true
+	d := doc{
+		Custom: customZeroType{Value: 5},
+	}
+
+	b, err := toml.Marshal(d)
+	assert.NoError(t, err)
+
+	// Field should be omitted
+	expected := ``
+
+	assert.Equal(t, expected, string(b))
+}
+
+// TestEncoderOmitzeroCustomIsZeroInlineTableNotZero tests omitzero with inline tables when not zero.
+func TestEncoderOmitzeroCustomIsZeroInlineTableNotZero(t *testing.T) {
+	type doc struct {
+		Custom customZeroType `toml:",omitzero,inline"`
+	}
+
+	// Custom.Value = 15, which is >= 10, so custom IsZero returns false
+	d := doc{
+		Custom: customZeroType{Value: 15},
+	}
+
+	b, err := toml.Marshal(d)
+	assert.NoError(t, err)
+
+	// Field should be present as inline table
+	expected := `Custom = {Value = 15}
+`
+
+	assert.Equal(t, expected, string(b))
+}
+
+// TestEncoderOmitzeroCustomIsZeroMixedTypes tests omitzero with a mix of custom and regular types.
+func TestEncoderOmitzeroCustomIsZeroMixedTypes(t *testing.T) {
+	type doc struct {
+		Custom  customZeroType `toml:",omitzero"`
+		Regular int            `toml:",omitzero"`
+		NoOmit  customZeroType `toml:""`
+		Pointer *int           `toml:",omitzero"`
+	}
+
+	d := doc{
+		Custom:  customZeroType{Value: 5}, // IsZero returns true
+		Regular: 0,                        // zero value
+		NoOmit:  customZeroType{Value: 5}, // not omitted (no omitzero tag)
+		Pointer: nil,                      // nil pointer
+	}
+
+	b, err := toml.Marshal(d)
+	assert.NoError(t, err)
+
+	// Custom is omitted (custom IsZero true), Regular is omitted (zero value),
+	// NoOmit is present (no omitzero tag), Pointer is omitted (nil)
+	expected := `[NoOmit]
+Value = 5
+`
+
+	assert.Equal(t, expected, string(b))
+}
+
+// TestEncoderOmitzeroCustomIsZeroSlice tests omitzero with slices containing custom types.
+func TestEncoderOmitzeroCustomIsZeroSlice(t *testing.T) {
+	type doc struct {
+		Items []customZeroType `toml:",omitzero"`
+	}
+
+	// Nil slice should be omitted (IsZero returns true for nil slices)
+	d := doc{
+		Items: nil,
+	}
+
+	b, err := toml.Marshal(d)
+	assert.NoError(t, err)
+
+	expected := ``
+
+	assert.Equal(t, expected, string(b))
+
+	// Empty but non-nil slice is NOT zero, so it's included
+	d2 := doc{
+		Items: []customZeroType{},
+	}
+
+	b2, err := toml.Marshal(d2)
+	assert.NoError(t, err)
+
+	expected2 := `Items = []
+`
+
+	assert.Equal(t, expected2, string(b2))
+}
+
+// TestEncoderOmitzeroCustomIsZeroNestedStruct tests omitzero with nested structs.
+func TestEncoderOmitzeroCustomIsZeroNestedStruct(t *testing.T) {
+	type inner struct {
+		Custom customZeroType `toml:",omitzero"`
+		Value  int            `toml:",omitzero"`
+	}
+	type doc struct {
+		Inner inner `toml:",omitzero"`
+	}
+
+	// Inner struct has all zero fields, but the struct itself is not zero
+	// (reflect.Value.IsZero checks if all fields are zero)
+	d := doc{
+		Inner: inner{
+			Custom: customZeroType{Value: 5}, // custom IsZero returns true
+			Value:  0,                        // zero value
+		},
+	}
+
+	b, err := toml.Marshal(d)
+	assert.NoError(t, err)
+
+	// Inner is present but its fields are omitted
+	expected := `[Inner]
+`
+
+	assert.Equal(t, expected, string(b))
+}
+
 func TestEncoderTagFieldName(t *testing.T) {
 	type doc struct {
 		String string `toml:"hello"`
 		OkSym  string `toml:"#"`
-		Bad    string `toml:"\"`
+		Bad    string `toml:"\"` //nolint:govet
 	}
 
 	d := doc{String: "world"}
@@ -1762,14 +2050,14 @@ func ExampleMarshal() {
 func ExampleMarshal_commented() {
 	type Common struct {
 		Listen               string        `toml:"listen"                     comment:"general listener"`
-		PprofListen          string        `toml:"pprof-listen"               comment:"listener to serve /debug/pprof requests. '-pprof' argument overrides it"`
-		MaxMetricsPerTarget  int           `toml:"max-metrics-per-target"     comment:"limit numbers of queried metrics per target in /render requests, 0 or negative = unlimited"`
+		PprofListen          string        `toml:"pprof-listen"               comment:"listener to serve /debug/pprof requests. '-pprof' argument overrides it"`                    //nolint:lll
+		MaxMetricsPerTarget  int           `toml:"max-metrics-per-target"     comment:"limit numbers of queried metrics per target in /render requests, 0 or negative = unlimited"` //nolint:lll
 		MemoryReturnInterval time.Duration `toml:"memory-return-interval"     comment:"daemon will return the freed memory to the OS when it>0"`
 	}
 
 	type Costs struct {
 		Cost       *int           `toml:"cost"        comment:"default cost (for wildcarded equivalence or matched with regex, or if no value cost set)"`
-		ValuesCost map[string]int `toml:"values-cost" comment:"cost with some value (for equivalence without wildcards) (additional tuning, usually not needed)"`
+		ValuesCost map[string]int `toml:"values-cost" comment:"cost with some value (for equivalence without wildcards) (additional tuning, usually not needed)"` //nolint:lll
 	}
 
 	type ClickHouse struct {
@@ -1784,7 +2072,7 @@ func ExampleMarshal_commented() {
 		DateTreeTableVersion    int               `toml:"date-tree-table-version,commented"`
 		TreeTimeout             time.Duration     `toml:"tree-timeout,commented"`
 		TagTable                string            `toml:"tag-table,commented"`
-		ExtraPrefix             string            `toml:"extra-prefix"             comment:"add extra prefix (directory in graphite) for all metrics, w/o trailing dot"`
+		ExtraPrefix             string            `toml:"extra-prefix"             comment:"add extra prefix (directory in graphite) for all metrics, w/o trailing dot"` //nolint:lll
 		ConnectTimeout          time.Duration     `toml:"connect-timeout"          comment:"TCP connection timeout"`
 		DataTableLegacy         string            `toml:"data-table,commented"`
 		RollupConfLegacy        string            `toml:"rollup-conf,commented"`
@@ -1879,24 +2167,30 @@ func ExampleMarshal_commented() {
 	// # output-file = ''
 }
 
+type TLS struct {
+	Cipher  string `toml:"cipher"`
+	Version string `toml:"version"`
+}
+
+func (t *TLS) TOMLComment() string {
+	return t.Cipher + t.Version + "this is a comment"
+}
+
 func TestReadmeComments(t *testing.T) {
-	type TLS struct {
-		Cipher  string `toml:"cipher"`
-		Version string `toml:"version"`
-	}
 	type Config struct {
 		Host string `toml:"host" comment:"Host IP to connect to."`
 		Port int    `toml:"port" comment:"Port of the remote server."`
-		Tls  TLS    `toml:"TLS,commented" comment:"Encryption parameters (optional)"`
+		TLS  TLS    `toml:"TLS,commented" comment:"Encryption parameters (optional)"`
 	}
 	example := Config{
 		Host: "127.0.0.1",
 		Port: 4242,
-		Tls: TLS{
+		TLS: TLS{
 			Cipher:  "AEAD-AES128-GCM-SHA256",
 			Version: "TLS 1.3",
 		},
 	}
+
 	out, err := toml.Marshal(example)
 	assert.NoError(t, err)
 
@@ -1910,5 +2204,466 @@ port = 4242
 # cipher = 'AEAD-AES128-GCM-SHA256'
 # version = 'TLS 1.3'
 `
+
+	fmt.Println(string(out))
 	assert.Equal(t, expected, string(out))
+}
+
+// test dynamic comments
+// dynamicCommenter implements TomlComment() to provide dynamic comments
+type dynamicCommenter struct {
+	Value   string
+	Comment string
+}
+
+func (d dynamicCommenter) TOMLComment() string {
+	return d.Comment
+}
+
+// staticComment has only struct tag comment
+type staticComment struct {
+	Value string
+}
+
+// noComment has no comment at all
+type noComment struct {
+	Value string
+}
+
+// pointerCommenter tests TomlComment() with pointer receivers
+type pointerCommenter struct {
+	Value   string
+	Comment string
+}
+
+func (p *pointerCommenter) TOMLComment() string {
+	return p.Comment
+}
+
+// serverConfig is a user-defined type based on map[string]string
+type serverConfig map[string]string
+
+func (s serverConfig) TOMLComment() string {
+	if host, ok := s["host"]; ok {
+		return "Configuration for " + host
+	}
+	return "Server configuration"
+}
+
+// TestTomlEncoderInterface tests that the TomlEncoder interface works correctly
+// for dynamic comments. It verifies three scenarios:
+// 1. If a property implements TomlEncoder (TomlComment()), that comment is used
+// 2. If not, but struct tag has comment, that comment is used
+// 3. If neither exists, no comment is added
+func TestTomlEncoderInterface(t *testing.T) {
+	examples := []struct {
+		desc     string
+		v        interface{}
+		expected string
+	}{
+		{
+			desc: "dynamic comment overrides struct tag",
+			v: struct {
+				Field dynamicCommenter `comment:"this should be ignored"`
+			}{
+				Field: dynamicCommenter{
+					Value:   "test value",
+					Comment: "dynamic comment from TomlComment()",
+				},
+			},
+			expected: `# dynamic comment from TomlComment()
+[Field]
+Value = 'test value'
+Comment = 'dynamic comment from TomlComment()'
+`,
+		},
+		{
+			desc: "struct tag comment when no TomlComment()",
+			v: struct {
+				Field staticComment `comment:"struct tag comment"`
+			}{
+				Field: staticComment{
+					Value: "test value",
+				},
+			},
+			expected: `# struct tag comment
+[Field]
+Value = 'test value'
+`,
+		},
+		{
+			desc: "no comment when neither TomlComment() nor struct tag",
+			v: struct {
+				Field noComment
+			}{
+				Field: noComment{
+					Value: "test value",
+				},
+			},
+			expected: `[Field]
+Value = 'test value'
+`,
+		},
+		{
+			desc: "multiple fields with different comment types",
+			v: struct {
+				Dynamic dynamicCommenter `comment:"ignored static comment"`
+				Static  staticComment    `comment:"struct tag comment"`
+				None    noComment
+			}{
+				Dynamic: dynamicCommenter{
+					Value:   "dynamic value",
+					Comment: "runtime dynamic comment",
+				},
+				Static: staticComment{
+					Value: "static value",
+				},
+				None: noComment{
+					Value: "no comment value",
+				},
+			},
+			expected: `# runtime dynamic comment
+[Dynamic]
+Value = 'dynamic value'
+Comment = 'runtime dynamic comment'
+
+# struct tag comment
+[Static]
+Value = 'static value'
+
+[None]
+Value = 'no comment value'
+`,
+		},
+		{
+			desc: "empty dynamic comment results in no comment",
+			v: struct {
+				Field dynamicCommenter `comment:"struct tag comment"`
+			}{
+				Field: dynamicCommenter{
+					Value:   "test value",
+					Comment: "", // empty comment
+				},
+			},
+			expected: `[Field]
+Value = 'test value'
+Comment = ''
+`,
+		},
+		{
+			desc: "multiline dynamic comment",
+			v: struct {
+				Field dynamicCommenter
+			}{
+				Field: dynamicCommenter{
+					Value:   "test value",
+					Comment: "First line of comment\nSecond line of comment\nThird line",
+				},
+			},
+			expected: `# First line of comment
+# Second line of comment
+# Third line
+[Field]
+Value = 'test value'
+Comment = "First line of comment\nSecond line of comment\nThird line"
+`,
+		},
+		{
+			desc: "pointer receiver TomlComment()",
+			v: struct {
+				Field *pointerCommenter `comment:"struct tag comment"`
+			}{
+				Field: &pointerCommenter{
+					Value:   "test value",
+					Comment: "pointer receiver comment",
+				},
+			},
+			expected: `# pointer receiver comment
+[Field]
+Value = 'test value'
+Comment = 'pointer receiver comment'
+`,
+		},
+		{
+			desc: "key-value with struct tag comments",
+			v: struct {
+				Name    string `comment:"static name comment"`
+				Version int    `comment:"static version comment"`
+			}{
+				Name:    "test",
+				Version: 42,
+			},
+			expected: `# static name comment
+Name = 'test'
+# static version comment
+Version = 42
+`,
+		},
+		{
+			desc: "array table with dynamic comments",
+			v: struct {
+				Items []dynamicCommenter `comment:"items comment"`
+			}{
+				Items: []dynamicCommenter{
+					{Value: "item1", Comment: "comment for item 1"},
+					{Value: "item2", Comment: "comment for item 2"},
+				},
+			},
+			expected: `# items comment
+# comment for item 1
+[[Items]]
+Value = 'item1'
+Comment = 'comment for item 1'
+
+# comment for item 2
+[[Items]]
+Value = 'item2'
+Comment = 'comment for item 2'
+`,
+		},
+		{
+			desc: "nested struct with dynamic comments",
+			v: struct {
+				Outer struct {
+					Field dynamicCommenter `comment:"ignored inner comment"`
+				} `comment:"outer comment"`
+			}{
+				Outer: struct {
+					Field dynamicCommenter `comment:"ignored inner comment"`
+				}{
+					Field: dynamicCommenter{
+						Value:   "nested value",
+						Comment: "dynamic nested comment",
+					},
+				},
+			},
+			expected: `# outer comment
+[Outer]
+# dynamic nested comment
+[Outer.Field]
+Value = 'nested value'
+Comment = 'dynamic nested comment'
+`,
+		},
+		{
+			desc: "TomlComment() takes precedence over struct tag",
+			v: struct {
+				Database dynamicCommenter `comment:"Database connection settings"`
+				Cache    dynamicCommenter `comment:"Cache configuration"`
+			}{
+				Database: dynamicCommenter{
+					Value:   "localhost:5432",
+					Comment: "Production database connection",
+				},
+				Cache: dynamicCommenter{
+					Value:   "redis://localhost:6379",
+					Comment: "Redis cache settings",
+				},
+			},
+			expected: `# Production database connection
+[Database]
+Value = 'localhost:5432'
+Comment = 'Production database connection'
+
+# Redis cache settings
+[Cache]
+Value = 'redis://localhost:6379'
+Comment = 'Redis cache settings'
+`,
+		},
+		{
+			desc: "list of map[string]string with struct tag comment",
+			v: struct {
+				Servers []map[string]string `comment:"Server configurations"`
+			}{
+				Servers: []map[string]string{
+					{"host": "localhost", "port": "8080"},
+					{"host": "example.com", "port": "443"},
+				},
+			},
+			expected: `# Server configurations
+[[Servers]]
+host = 'localhost'
+port = '8080'
+
+[[Servers]]
+host = 'example.com'
+port = '443'
+`,
+		},
+		{
+			desc: "user-defined map type with TomlComment()",
+			v: struct {
+				Servers []serverConfig `comment:"static comment ignored"`
+			}{
+				Servers: []serverConfig{
+					{"host": "localhost", "port": "8080"},
+					{"host": "example.com", "port": "443"},
+				},
+			},
+			expected: `# static comment ignored
+# Configuration for localhost
+[[Servers]]
+host = 'localhost'
+port = '8080'
+
+# Configuration for example.com
+[[Servers]]
+host = 'example.com'
+port = '443'
+`,
+		},
+	}
+
+	for _, e := range examples {
+		e := e
+		t.Run(e.desc, func(t *testing.T) {
+			out, err := toml.Marshal(e.v)
+			assert.NoError(t, err)
+			assert.Equal(t, e.expected, string(out))
+		})
+	}
+}
+
+// customTomlMarshaler implements MarshalToml for testing
+type customTomlMarshaler struct {
+	Name  string
+	Value int
+}
+
+func (c customTomlMarshaler) MarshalTOML() ([]byte, error) {
+	return []byte("testmarshal"), nil
+}
+
+// errorTomlMarshaler always returns an error
+type errorTomlMarshaler struct{}
+
+func (e errorTomlMarshaler) MarshalTOML() ([]byte, error) {
+	return nil, fmt.Errorf("intentional marshal error")
+}
+
+// pointerTomlMarshaler implements MarshalToml with pointer receiver
+type pointerTomlMarshaler struct {
+	Data string `toml:"data"`
+}
+
+func (p *pointerTomlMarshaler) MarshalTOML() ([]byte, error) {
+	return []byte("testmarshal"), nil
+}
+
+// TestMarshalTomlInterface tests the MarshalToml interface implementation
+func TestMarshalTomlInterface(t *testing.T) {
+	examples := []struct {
+		desc     string
+		v        interface{}
+		expected string
+		err      bool
+	}{
+		{
+			desc:     "basic MarshalToml implementation",
+			v:        customTomlMarshaler{Name: "test", Value: 42},
+			expected: `testmarshal`,
+		},
+		{
+			desc: "MarshalToml in map",
+			v: map[string]customTomlMarshaler{
+				"custom": {Name: "nested", Value: 100},
+			},
+			expected: `[custom]
+testmarshal`,
+		},
+		{
+			desc: "MarshalToml with error",
+			v:    errorTomlMarshaler{},
+			err:  true,
+		},
+		{
+			desc: "MarshalToml with error in map",
+			v: map[string]interface{}{
+				"field": errorTomlMarshaler{},
+			},
+			err: true,
+		},
+		{
+			desc: "pointer receiver MarshalToml",
+			v:    &pointerTomlMarshaler{Data: "pointer data"},
+			expected: `data = 'pointer data'
+`,
+		},
+		{
+			desc: "pointer receiver MarshalToml in struct",
+			v: struct {
+				Field *pointerTomlMarshaler
+			}{
+				Field: &pointerTomlMarshaler{Data: "nested pointer"},
+			},
+			expected: `[Field]
+data = 'nested pointer'
+`,
+		},
+		{
+			desc: "MarshalToml in slice",
+			v: map[string][]interface{}{
+				"items": {
+					customTomlMarshaler{Name: "item1", Value: 1},
+					customTomlMarshaler{Name: "item2", Value: 2},
+				},
+			},
+			expected: `[[items]]
+testmarshal
+[[items]]
+testmarshal`,
+		},
+		{
+			desc: "MarshalToml in nested structs",
+			v: struct {
+				Outer struct {
+					Inner customTomlMarshaler
+				}
+			}{
+				Outer: struct {
+					Inner customTomlMarshaler
+				}{
+					Inner: customTomlMarshaler{Name: "nested", Value: 99},
+				},
+			},
+			expected: `[Outer]
+[Outer.Inner]
+testmarshal`,
+		},
+		{
+			desc: "MarshalToml with array elements",
+			v: struct {
+				Simple customTomlMarshaler
+				Number int
+				Text   string
+				Array  []string
+			}{
+				Simple: customTomlMarshaler{Name: "simple", Value: 42},
+				Number: 100,
+				Text:   "hello",
+				Array:  []string{"one", "two", "three"},
+			},
+			expected: `Number = 100
+Text = 'hello'
+Array = ['one', 'two', 'three']
+
+[Simple]
+testmarshal`,
+		},
+	}
+
+	for _, e := range examples {
+		e := e
+		t.Run(e.desc, func(t *testing.T) {
+			b, err := toml.Marshal(e.v)
+			if e.err {
+				assert.Error(t, err)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, e.expected, string(b))
+		})
+	}
 }

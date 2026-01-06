@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -42,7 +43,7 @@ type Encoder struct {
 	arraysMultiline    bool
 	indentSymbol       string
 	indentTables       bool
-	marshalJsonNumbers bool
+	marshalJSONNumbers bool
 }
 
 // NewEncoder returns a new Encoder that writes to w.
@@ -89,15 +90,33 @@ func (enc *Encoder) SetIndentTables(indent bool) *Encoder {
 	return enc
 }
 
-// SetMarshalJsonNumbers forces the encoder to serialize `json.Number` as a
+// SetMarshalJSONNumbers forces the encoder to serialize `json.Number` as a
 // float or integer instead of relying on TextMarshaler to emit a string.
 //
 // *Unstable:* This method does not follow the compatibility guarantees of
 // semver. It can be changed or removed without a new major version being
 // issued.
-func (enc *Encoder) SetMarshalJsonNumbers(indent bool) *Encoder {
-	enc.marshalJsonNumbers = indent
+func (enc *Encoder) SetMarshalJSONNumbers(indent bool) *Encoder {
+	enc.marshalJSONNumbers = indent
 	return enc
+}
+
+// Interface that a node can implement to use said functionality
+type TOMLEncoderComment interface {
+	// comment returns a comment string for any particular node, this is mostly for implementing
+	// dynamic comments
+	TOMLComment() string
+}
+
+// MarshalTOML interface can be implemented by types to write custom marshal functions
+// currently only supported by maps, tables, slice of tables etc
+type MarshalTOML interface {
+	MarshalTOML() ([]byte, error)
+}
+
+// UnmarshalTOML interface can be implemented by types to write custom unmarshal functions
+type UnmarshalTOML interface {
+	UnmarshalTOML([]byte) error
 }
 
 // Encode writes a TOML representation of v to the stream.
@@ -179,7 +198,7 @@ func (enc *Encoder) Encode(v interface{}) error {
 	ctx.inline = enc.tablesInline
 
 	if v == nil {
-		return fmt.Errorf("toml: cannot encode a nil interface")
+		return errors.New("toml: cannot encode a nil interface")
 	}
 
 	b, err := enc.encode(b, ctx, reflect.ValueOf(v))
@@ -269,16 +288,15 @@ func (enc *Encoder) encode(b []byte, ctx encoderCtx, v reflect.Value) ([]byte, e
 	case LocalDateTime:
 		return append(b, x.String()...), nil
 	case json.Number:
-		if enc.marshalJsonNumbers {
+		if enc.marshalJSONNumbers {
 			if x == "" { /// Useful zero value.
 				return append(b, "0"...), nil
 			} else if v, err := x.Int64(); err == nil {
 				return enc.encode(b, ctx, reflect.ValueOf(v))
 			} else if f, err := x.Float64(); err == nil {
 				return enc.encode(b, ctx, reflect.ValueOf(f))
-			} else {
-				return nil, fmt.Errorf("toml: unable to convert %q to int64 or float64", x)
 			}
+			return nil, fmt.Errorf("toml: unable to convert %q to int64 or float64", x)
 		}
 	}
 
@@ -312,7 +330,7 @@ func (enc *Encoder) encode(b []byte, ctx encoderCtx, v reflect.Value) ([]byte, e
 		return enc.encodeSlice(b, ctx, v)
 	case reflect.Interface:
 		if v.IsNil() {
-			return nil, fmt.Errorf("toml: encoding a nil interface is not supported")
+			return nil, errors.New("toml: encoding a nil interface is not supported")
 		}
 
 		return enc.encode(b, ctx, v.Elem())
@@ -325,47 +343,67 @@ func (enc *Encoder) encode(b []byte, ctx encoderCtx, v reflect.Value) ([]byte, e
 
 	// values
 	case reflect.String:
+		if marshaler, ok := i.(MarshalTOML); ok {
+			return enc.MarshalTOML(ctx, b, marshaler)
+		}
 		b = enc.encodeString(b, v.String(), ctx.options)
 	case reflect.Float32:
+		if marshaler, ok := i.(MarshalTOML); ok {
+			return enc.MarshalTOML(ctx, b, marshaler)
+		}
 		f := v.Float()
 
-		if math.IsNaN(f) {
+		switch {
+		case math.IsNaN(f):
 			b = append(b, "nan"...)
-		} else if f > math.MaxFloat32 {
+		case f > math.MaxFloat32:
 			b = append(b, "inf"...)
-		} else if f < -math.MaxFloat32 {
+		case f < -math.MaxFloat32:
 			b = append(b, "-inf"...)
-		} else if math.Trunc(f) == f {
+		case math.Trunc(f) == f:
 			b = strconv.AppendFloat(b, f, 'f', 1, 32)
-		} else {
+		default:
 			b = strconv.AppendFloat(b, f, 'f', -1, 32)
 		}
 	case reflect.Float64:
+		if marshaler, ok := i.(MarshalTOML); ok {
+			return enc.MarshalTOML(ctx, b, marshaler)
+		}
 		f := v.Float()
-		if math.IsNaN(f) {
+		switch {
+		case math.IsNaN(f):
 			b = append(b, "nan"...)
-		} else if f > math.MaxFloat64 {
+		case f > math.MaxFloat64:
 			b = append(b, "inf"...)
-		} else if f < -math.MaxFloat64 {
+		case f < -math.MaxFloat64:
 			b = append(b, "-inf"...)
-		} else if math.Trunc(f) == f {
+		case math.Trunc(f) == f:
 			b = strconv.AppendFloat(b, f, 'f', 1, 64)
-		} else {
+		default:
 			b = strconv.AppendFloat(b, f, 'f', -1, 64)
 		}
 	case reflect.Bool:
+		if marshaler, ok := i.(MarshalTOML); ok {
+			return enc.MarshalTOML(ctx, b, marshaler)
+		}
 		if v.Bool() {
 			b = append(b, "true"...)
 		} else {
 			b = append(b, "false"...)
 		}
 	case reflect.Uint64, reflect.Uint32, reflect.Uint16, reflect.Uint8, reflect.Uint:
+		if marshaler, ok := i.(MarshalTOML); ok {
+			return enc.MarshalTOML(ctx, b, marshaler)
+		}
 		x := v.Uint()
 		if x > uint64(math.MaxInt64) {
 			return nil, fmt.Errorf("toml: not encoding uint (%d) greater than max int64 (%d)", x, int64(math.MaxInt64))
 		}
 		b = strconv.AppendUint(b, x, 10)
 	case reflect.Int64, reflect.Int32, reflect.Int16, reflect.Int8, reflect.Int:
+		if marshaler, ok := i.(MarshalTOML); ok {
+			return enc.MarshalTOML(ctx, b, marshaler)
+		}
 		b = strconv.AppendInt(b, v.Int(), 10)
 	default:
 		return nil, fmt.Errorf("toml: cannot encode value of type %s", v.Kind())
@@ -388,7 +426,28 @@ func shouldOmitEmpty(options valueOptions, v reflect.Value) bool {
 }
 
 func shouldOmitZero(options valueOptions, v reflect.Value) bool {
-	return options.omitzero && v.IsZero()
+	if !options.omitzero {
+		return false
+	}
+
+	// Check if the type implements isZeroer interface (has a custom IsZero method).
+	if v.Type().Implements(isZeroerType) {
+		return v.Interface().(isZeroer).IsZero()
+	}
+
+	// Check if pointer type implements isZeroer.
+	if reflect.PointerTo(v.Type()).Implements(isZeroerType) {
+		if v.CanAddr() {
+			return v.Addr().Interface().(isZeroer).IsZero()
+		}
+		// Create a temporary addressable copy to call the pointer receiver method.
+		pv := reflect.New(v.Type())
+		pv.Elem().Set(v)
+		return pv.Interface().(isZeroer).IsZero()
+	}
+
+	// Fall back to reflect's IsZero for types without custom IsZero method.
+	return v.IsZero()
 }
 
 func (enc *Encoder) encodeKv(b []byte, ctx encoderCtx, options valueOptions, v reflect.Value) ([]byte, error) {
@@ -441,8 +500,9 @@ func isEmptyValue(v reflect.Value) bool {
 		return v.Float() == 0
 	case reflect.Interface, reflect.Ptr:
 		return v.IsNil()
+	default:
+		return false
 	}
-	return false
 }
 
 func isEmptyStruct(v reflect.Value) bool {
@@ -486,7 +546,7 @@ func (enc *Encoder) encodeString(b []byte, v string, options valueOptions) []byt
 func needsQuoting(v string) bool {
 	// TODO: vectorize
 	for _, b := range []byte(v) {
-		if b == '\'' || b == '\r' || b == '\n' || characters.InvalidAscii(b) {
+		if b == '\'' || b == '\r' || b == '\n' || characters.InvalidASCII(b) {
 			return true
 		}
 	}
@@ -580,9 +640,9 @@ func (enc *Encoder) encodeUnquotedKey(b []byte, v string) []byte {
 	return append(b, v...)
 }
 
-func (enc *Encoder) encodeTableHeader(ctx encoderCtx, b []byte) ([]byte, error) {
+func (enc *Encoder) encodeTableHeader(ctx encoderCtx, b []byte) []byte {
 	if len(ctx.parentKey) == 0 {
-		return b, nil
+		return b
 	}
 
 	b = enc.encodeComment(ctx.indent, ctx.options.comment, b)
@@ -602,10 +662,9 @@ func (enc *Encoder) encodeTableHeader(ctx encoderCtx, b []byte) ([]byte, error) 
 
 	b = append(b, "]\n"...)
 
-	return b, nil
+	return b
 }
 
-//nolint:cyclop
 func (enc *Encoder) encodeKey(b []byte, k string) []byte {
 	needsQuotation := false
 	cannotUseLiteral := false
@@ -642,37 +701,41 @@ func (enc *Encoder) encodeKey(b []byte, k string) []byte {
 
 func (enc *Encoder) keyToString(k reflect.Value) (string, error) {
 	keyType := k.Type()
-	switch {
-	case keyType.Kind() == reflect.String:
-		return k.String(), nil
-
-	case keyType.Implements(textMarshalerType):
+	if keyType.Implements(textMarshalerType) {
 		keyB, err := k.Interface().(encoding.TextMarshaler).MarshalText()
 		if err != nil {
 			return "", fmt.Errorf("toml: error marshalling key %v from text: %w", k, err)
 		}
 		return string(keyB), nil
+	}
 
-	case keyType.Kind() == reflect.Int || keyType.Kind() == reflect.Int8 || keyType.Kind() == reflect.Int16 || keyType.Kind() == reflect.Int32 || keyType.Kind() == reflect.Int64:
+	switch keyType.Kind() {
+	case reflect.String:
+		return k.String(), nil
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		return strconv.FormatInt(k.Int(), 10), nil
 
-	case keyType.Kind() == reflect.Uint || keyType.Kind() == reflect.Uint8 || keyType.Kind() == reflect.Uint16 || keyType.Kind() == reflect.Uint32 || keyType.Kind() == reflect.Uint64:
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return strconv.FormatUint(k.Uint(), 10), nil
 
-	case keyType.Kind() == reflect.Float32:
+	case reflect.Float32:
 		return strconv.FormatFloat(k.Float(), 'f', -1, 32), nil
 
-	case keyType.Kind() == reflect.Float64:
+	case reflect.Float64:
 		return strconv.FormatFloat(k.Float(), 'f', -1, 64), nil
+
+	default:
+		return "", fmt.Errorf("toml: type %s is not supported as a map key", keyType.Kind())
 	}
-	return "", fmt.Errorf("toml: type %s is not supported as a map key", keyType.Kind())
 }
 
 func (enc *Encoder) encodeMap(b []byte, ctx encoderCtx, v reflect.Value) ([]byte, error) {
-	var (
-		t                 table
-		emptyValueOptions valueOptions
-	)
+	var emptyValueOptions valueOptions
+
+	t := table{
+		value: v,
+	}
 
 	iter := v.MapRange()
 	for iter.Next() {
@@ -715,6 +778,11 @@ type entry struct {
 type table struct {
 	kvs    []entry
 	tables []entry
+	value  reflect.Value
+}
+
+func (t *table) setValue(v reflect.Value) {
+	t.value = v
 }
 
 func (t *table) pushKV(k string, v reflect.Value, options valueOptions) {
@@ -739,8 +807,13 @@ func (t *table) pushTable(k string, v reflect.Value, options valueOptions) {
 func walkStruct(ctx encoderCtx, t *table, v reflect.Value) {
 	// TODO: cache this
 	typ := v.Type()
+	value := v
+	if v.Kind() == reflect.Ptr {
+		value = v.Elem()
+	}
 	for i := 0; i < typ.NumField(); i++ {
 		fieldType := typ.Field(i)
+		fieldValue := value.Field(i)
 
 		// only consider exported fields
 		if fieldType.PkgPath != "" {
@@ -769,13 +842,20 @@ func walkStruct(ctx encoderCtx, t *table, v reflect.Value) {
 					walkStruct(ctx, t, f.Elem())
 				}
 				continue
-			} else {
-				k = fieldType.Name
 			}
+			k = fieldType.Name
 		}
 
 		if isNil(f) {
 			continue
+		}
+
+		comment := fieldType.Tag.Get("comment")
+		if fieldValue.CanInterface() {
+			if commenter, ok := fieldValue.Interface().(TOMLEncoderComment); ok {
+				fmt.Println("testing")
+				comment = commenter.TOMLComment()
+			}
 		}
 
 		options := valueOptions{
@@ -783,7 +863,7 @@ func walkStruct(ctx encoderCtx, t *table, v reflect.Value) {
 			omitempty: opts.omitempty,
 			omitzero:  opts.omitzero,
 			commented: opts.commented,
-			comment:   fieldType.Tag.Get("comment"),
+			comment:   comment,
 		}
 
 		if opts.inline || !willConvertToTableOrArrayTable(ctx, f) {
@@ -795,7 +875,9 @@ func walkStruct(ctx encoderCtx, t *table, v reflect.Value) {
 }
 
 func (enc *Encoder) encodeStruct(b []byte, ctx encoderCtx, v reflect.Value) ([]byte, error) {
-	var t table
+	t := table{
+		value: v,
+	}
 
 	walkStruct(ctx, &t, v)
 
@@ -891,10 +973,7 @@ func (enc *Encoder) encodeTable(b []byte, ctx encoderCtx, t table) ([]byte, erro
 	}
 
 	if !ctx.skipTableHeader {
-		b, err = enc.encodeTableHeader(ctx, b)
-		if err != nil {
-			return nil, err
-		}
+		b = enc.encodeTableHeader(ctx, b)
 
 		if enc.indentTables && len(ctx.parentKey) > 0 {
 			ctx.indent++
@@ -903,6 +982,14 @@ func (enc *Encoder) encodeTable(b []byte, ctx encoderCtx, t table) ([]byte, erro
 	ctx.skipTableHeader = false
 
 	hasNonEmptyKV := false
+
+	// marshal table if value implements marshaltoml interface
+	if t.value.CanInterface() {
+		if marshaler, ok := t.value.Interface().(MarshalTOML); ok {
+			return enc.MarshalTOML(ctx, b, marshaler)
+		}
+	}
+
 	for _, kv := range t.kvs {
 		if shouldOmitEmpty(kv.Options, kv.Value) {
 			continue
@@ -997,11 +1084,14 @@ func willConvertToTable(ctx encoderCtx, v reflect.Value) bool {
 	if !v.IsValid() {
 		return false
 	}
-	if v.Type() == timeType || v.Type().Implements(textMarshalerType) || (v.Kind() != reflect.Ptr && v.CanAddr() && reflect.PointerTo(v.Type()).Implements(textMarshalerType)) {
+	t := v.Type()
+	if t == timeType || t.Implements(textMarshalerType) {
+		return false
+	}
+	if v.Kind() != reflect.Ptr && v.CanAddr() && reflect.PointerTo(t).Implements(textMarshalerType) {
 		return false
 	}
 
-	t := v.Type()
 	switch t.Kind() {
 	case reflect.Map, reflect.Struct:
 		return !ctx.inline
@@ -1099,6 +1189,12 @@ func (enc *Encoder) encodeSliceAsArrayTable(b []byte, ctx encoderCtx, v reflect.
 			b = append(b, "\n"...)
 		}
 
+		comment := ""
+		if commenter, ok := v.Index(i).Interface().(TOMLEncoderComment); ok {
+			comment = commenter.TOMLComment()
+		}
+		b = enc.encodeComment(ctx.indent, comment, b)
+
 		b = append(b, scratch...)
 
 		var err error
@@ -1155,6 +1251,16 @@ func (enc *Encoder) encodeSliceAsArray(b []byte, ctx encoderCtx, v reflect.Value
 
 	b = append(b, ']')
 
+	return b, nil
+}
+
+func (enc *Encoder) MarshalTOML(ctx encoderCtx, b []byte, m MarshalTOML) ([]byte, error) {
+	v, err := m.MarshalTOML()
+	if err != nil {
+		return b, err
+	}
+
+	b = append(b, v...)
 	return b, nil
 }
 

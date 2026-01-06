@@ -12,7 +12,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/pelletier/go-toml/v2/internal/danger"
 	"github.com/pelletier/go-toml/v2/internal/tracker"
 	"github.com/pelletier/go-toml/v2/unstable"
 )
@@ -123,6 +122,7 @@ func (d *Decoder) Decode(v interface{}) error {
 	dec := decoder{
 		strict: strict{
 			Enabled: d.strict,
+			doc:     b,
 		},
 		unmarshalerInterface: d.unmarshalerInterface,
 	}
@@ -226,7 +226,7 @@ func (d *decoder) FromParser(v interface{}) error {
 	}
 
 	if r.IsNil() {
-		return fmt.Errorf("toml: decoding pointer target cannot be nil")
+		return errors.New("toml: decoding pointer target cannot be nil")
 	}
 
 	r = r.Elem()
@@ -273,7 +273,7 @@ func (d *decoder) handleRootExpression(expr *unstable.Node, v reflect.Value) err
 	var err error
 	var first bool // used for to clear array tables on first use
 
-	if !(d.skipUntilTable && expr.Kind == unstable.KeyValue) {
+	if !d.skipUntilTable || expr.Kind != unstable.KeyValue {
 		first, err = d.seen.CheckExpression(expr)
 		if err != nil {
 			return err
@@ -378,7 +378,7 @@ func (d *decoder) handleArrayTableCollectionLast(key unstable.Iterator, v reflec
 	case reflect.Array:
 		idx := d.arrayIndex(true, v)
 		if idx >= v.Len() {
-			return v, fmt.Errorf("%s at position %d", d.typeMismatchError("array table", v.Type()), idx)
+			return v, fmt.Errorf("%w at position %d", d.typeMismatchError("array table", v.Type()), idx)
 		}
 		elem := v.Index(idx)
 		_, err := d.handleArrayTable(key, elem)
@@ -453,14 +453,14 @@ func (d *decoder) handleArrayTableCollection(key unstable.Iterator, v reflect.Va
 	case reflect.Array:
 		idx := d.arrayIndex(false, v)
 		if idx >= v.Len() {
-			return v, fmt.Errorf("%s at position %d", d.typeMismatchError("array table", v.Type()), idx)
+			return v, fmt.Errorf("%w at position %d", d.typeMismatchError("array table", v.Type()), idx)
 		}
 		elem := v.Index(idx)
 		_, err := d.handleArrayTable(key, elem)
 		return v, err
+	default:
+		return d.handleArrayTable(key, v)
 	}
-
-	return d.handleArrayTable(key, v)
 }
 
 func (d *decoder) handleKeyPart(key unstable.Iterator, v reflect.Value, nextFn handlerFn, makeFn valueMakerFn) (reflect.Value, error) {
@@ -494,7 +494,8 @@ func (d *decoder) handleKeyPart(key unstable.Iterator, v reflect.Value, nextFn h
 
 		mv := v.MapIndex(mk)
 		set := false
-		if !mv.IsValid() {
+		switch {
+		case !mv.IsValid():
 			// If there is no value in the map, create a new one according to
 			// the map type. If the element type is interface, create either a
 			// map[string]interface{} or a []interface{} depending on whether
@@ -507,13 +508,13 @@ func (d *decoder) handleKeyPart(key unstable.Iterator, v reflect.Value, nextFn h
 				mv = reflect.New(t).Elem()
 			}
 			set = true
-		} else if mv.Kind() == reflect.Interface {
+		case mv.Kind() == reflect.Interface:
 			mv = mv.Elem()
 			if !mv.IsValid() {
 				mv = makeFn()
 			}
 			set = true
-		} else if !mv.CanAddr() {
+		case !mv.CanAddr():
 			vt := v.Type()
 			t := vt.Elem()
 			oldmv := mv
@@ -620,9 +621,119 @@ func (d *decoder) handleTable(key unstable.Iterator, v reflect.Value) (reflect.V
 	return d.handleKeyValues(v)
 }
 
+func (d *decoder) tryUnmarshalTOMLWithKeyValues(v reflect.Value) (reflect.Value, error) {
+	origV := v
+	type exprInfo struct {
+		keyRaw          unstable.Range
+		keyData         []byte
+		valueRaw        unstable.Range
+		valueData       []byte
+		valueSerialized string // For arrays/complex types that need immediate serialization
+	}
+
+	var exprs []exprInfo
+	allHaveRaw := true
+
+	// iterate over all the key value pairs till we hit non key value node
+	for d.nextExpr() {
+		expr := d.expr()
+		if expr.Kind != unstable.KeyValue {
+			d.stashExpr()
+			break
+		}
+
+		// build expr array while scoping key values so we can use this later
+		keyIt := expr.Key()
+		keyNode := keyIt.Node()
+		valueNode := expr.Value()
+
+		info := exprInfo{
+			keyRaw:    keyNode.Raw,
+			keyData:   append([]byte(nil), keyNode.Data...),
+			valueRaw:  valueNode.Raw,
+			valueData: append([]byte(nil), valueNode.Data...),
+		}
+
+		// for arrays, serialize immediately since we can't copy the node structure
+		if valueNode.Kind == unstable.Array {
+			info.valueSerialized = string(d.serializeArrayChildNode(valueNode))
+			allHaveRaw = false // Arrays need slow path
+		}
+
+		exprs = append(exprs, info)
+
+		// track whether all values have Raw fields for fast path
+		if valueNode.Raw.Length == 0 {
+			allHaveRaw = false
+		}
+	}
+
+	// nothing todo if no key values inm expr
+	if len(exprs) == 0 {
+		return origV, nil
+	}
+
+	var rawData []byte
+
+	if allHaveRaw {
+		// FAST PATH: Extract raw byte range directly from document
+		firstKeyOffset := exprs[0].keyRaw.Offset
+		lastValue := exprs[len(exprs)-1].valueRaw
+		lastValueEnd := lastValue.Offset + lastValue.Length
+		rawData = d.p.Data()[firstKeyOffset:lastValueEnd]
+	} else {
+		// SLOW PATH: Reconstruct TOML from parsed nodes
+		// Necessary for bool, array, datetime types that lack Raw fields
+		var tomlData strings.Builder
+		for _, e := range exprs {
+			tomlData.WriteString(string(e.keyData))
+			tomlData.WriteString(" = ")
+			if e.valueSerialized != "" {
+				// for array use pre serialized values since they are built from child values
+				tomlData.WriteString(e.valueSerialized)
+			} else if e.valueRaw.Length > 0 {
+				valueRaw := d.p.Data()[e.valueRaw.Offset : e.valueRaw.Offset+e.valueRaw.Length]
+				tomlData.Write(valueRaw)
+			} else {
+				tomlData.Write(e.valueData)
+			}
+			tomlData.WriteString("\n")
+		}
+		rawData = []byte(tomlData.String())
+	}
+
+	// call the custom UnmarshalTOML implementation
+	err := v.Addr().Interface().(UnmarshalTOML).UnmarshalTOML(rawData)
+	if err != nil {
+		return reflect.Value{}, err
+	}
+	return origV, nil
+}
+
 // Handle root expressions until the end of the document or the next
 // non-key-value.
 func (d *decoder) handleKeyValues(v reflect.Value) (reflect.Value, error) {
+	// Dereference pointers to get to the actual value
+	origV := v
+	for v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			v.Set(reflect.New(v.Type().Elem()))
+		}
+		v = v.Elem()
+	}
+
+	// Check if the type implements UnmarshalTOML interface
+	// this path either reconstructs parts of toml to pass entire table node into the unmarshalerInterface.
+	// other route is a fast route which uses raw data, trims part of the raw data and passes it into the unmarshalerInterface
+	// this route helps avoid reconstruction of the toml string
+	if v.CanAddr() && v.Addr().Type().Implements(unmarshalTOMLType) {
+		return d.tryUnmarshalTOMLWithKeyValues(v)
+	}
+
+	// Restore v for normal processing
+	v = origV
+
+	// Normal processing for types that don't implement UnmarshalTOML
 	var rv reflect.Value
 	for d.nextExpr() {
 		expr := d.expr()
@@ -702,6 +813,12 @@ func (d *decoder) handleValue(value *unstable.Node, v reflect.Value) error {
 	}
 
 	ok, err := d.tryTextUnmarshaler(value, v)
+	if ok || err != nil {
+		return err
+	}
+
+	// this tried unmarshaling similar to encoding/json unmarshal interface
+	ok, err = d.tryUnmarshalTOML(value, v)
 	if ok || err != nil {
 		return err
 	}
@@ -880,6 +997,50 @@ func (d *decoder) unmarshalLocalTime(value *unstable.Node, v reflect.Value) erro
 	return nil
 }
 
+func (d *decoder) serializeArrayChildNode(value *unstable.Node) []byte {
+	if value.Kind != unstable.Array {
+		return []byte("")
+	}
+
+	var buf strings.Builder
+	buf.WriteString("[")
+	it := value.Children()
+	first := true
+	for it.Next() {
+		child := it.Node()
+		if !first {
+			buf.WriteString(", ")
+		}
+		first = false
+
+		// Serialize each array element
+		if child.Raw.Length > 0 {
+			buf.Write(d.p.Data()[child.Raw.Offset : child.Raw.Offset+child.Raw.Length])
+		} else if len(child.Data) > 0 {
+			buf.Write(child.Data)
+		}
+	}
+	buf.WriteString("]")
+	return []byte(buf.String())
+}
+
+func (d *decoder) tryUnmarshalTOML(value *unstable.Node, v reflect.Value) (bool, error) {
+	if v.CanAddr() && v.Addr().Type().Implements(unmarshalTOMLType) {
+		var data []byte
+
+		// Arrays don't have Data populated, need to serialize them
+		if value.Kind == unstable.Array {
+			data = d.serializeArrayChildNode(value)
+		} else {
+			data = value.Data
+		}
+
+		err := v.Addr().Interface().(UnmarshalTOML).UnmarshalTOML(data)
+		return true, err
+	}
+	return false, nil
+}
+
 func (d *decoder) unmarshalLocalDateTime(value *unstable.Node, v reflect.Value) error {
 	ldt, rest, err := parseLocalDateTime(value.Data)
 	if err != nil {
@@ -953,8 +1114,9 @@ const (
 // compile time, so it is computed during initialization.
 var maxUint int64 = math.MaxInt64
 
-func init() {
+func init() { //nolint:gochecknoinits
 	m := uint64(^uint(0))
+	// #nosec G115
 	if m < uint64(maxUint) {
 		maxUint = int64(m)
 	}
@@ -1034,7 +1196,7 @@ func (d *decoder) unmarshalInteger(value *unstable.Node, v reflect.Value) error 
 	case reflect.Interface:
 		r = reflect.ValueOf(i)
 	default:
-		return unstable.NewParserError(d.p.Raw(value.Raw), d.typeMismatchString("integer", v.Type()))
+		return unstable.NewParserError(d.p.Raw(value.Raw), "%s", d.typeMismatchString("integer", v.Type()))
 	}
 
 	if !r.Type().AssignableTo(v.Type()) {
@@ -1053,7 +1215,7 @@ func (d *decoder) unmarshalString(value *unstable.Node, v reflect.Value) error {
 	case reflect.Interface:
 		v.Set(reflect.ValueOf(string(value.Data)))
 	default:
-		return unstable.NewParserError(d.p.Raw(value.Raw), d.typeMismatchString("string", v.Type()))
+		return unstable.NewParserError(d.p.Raw(value.Raw), "%s", d.typeMismatchString("string", v.Type()))
 	}
 
 	return nil
@@ -1104,35 +1266,39 @@ func (d *decoder) keyFromData(keyType reflect.Type, data []byte) (reflect.Value,
 			return reflect.Value{}, fmt.Errorf("toml: error unmarshalling key type %s from text: %w", stringType, err)
 		}
 		return mk.Elem(), nil
+	}
 
-	case keyType.Kind() == reflect.Int || keyType.Kind() == reflect.Int8 || keyType.Kind() == reflect.Int16 || keyType.Kind() == reflect.Int32 || keyType.Kind() == reflect.Int64:
+	switch keyType.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
 		key, err := strconv.ParseInt(string(data), 10, 64)
 		if err != nil {
 			return reflect.Value{}, fmt.Errorf("toml: error parsing key of type %s from integer: %w", stringType, err)
 		}
 		return reflect.ValueOf(key).Convert(keyType), nil
-	case keyType.Kind() == reflect.Uint || keyType.Kind() == reflect.Uint8 || keyType.Kind() == reflect.Uint16 || keyType.Kind() == reflect.Uint32 || keyType.Kind() == reflect.Uint64:
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		key, err := strconv.ParseUint(string(data), 10, 64)
 		if err != nil {
 			return reflect.Value{}, fmt.Errorf("toml: error parsing key of type %s from unsigned integer: %w", stringType, err)
 		}
 		return reflect.ValueOf(key).Convert(keyType), nil
 
-	case keyType.Kind() == reflect.Float32:
+	case reflect.Float32:
 		key, err := strconv.ParseFloat(string(data), 32)
 		if err != nil {
 			return reflect.Value{}, fmt.Errorf("toml: error parsing key of type %s from float: %w", stringType, err)
 		}
 		return reflect.ValueOf(float32(key)), nil
 
-	case keyType.Kind() == reflect.Float64:
+	case reflect.Float64:
 		key, err := strconv.ParseFloat(string(data), 64)
 		if err != nil {
 			return reflect.Value{}, fmt.Errorf("toml: error parsing key of type %s from float: %w", stringType, err)
 		}
 		return reflect.ValueOf(float64(key)), nil
+
+	default:
+		return reflect.Value{}, fmt.Errorf("toml: cannot convert map key of type %s to expected type %s", stringType, keyType)
 	}
-	return reflect.Value{}, fmt.Errorf("toml: cannot convert map key of type %s to expected type %s", stringType, keyType)
 }
 
 func (d *decoder) handleKeyValuePart(key unstable.Iterator, value *unstable.Node, v reflect.Value) (reflect.Value, error) {
@@ -1294,13 +1460,13 @@ func fieldByIndex(v reflect.Value, path []int) reflect.Value {
 
 type fieldPathsMap = map[string][]int
 
-var globalFieldPathsCache atomic.Value // map[danger.TypeID]fieldPathsMap
+var globalFieldPathsCache atomic.Value // map[reflect.Type]fieldPathsMap
 
 func structFieldPath(v reflect.Value, name string) ([]int, bool) {
 	t := v.Type()
 
-	cache, _ := globalFieldPathsCache.Load().(map[danger.TypeID]fieldPathsMap)
-	fieldPaths, ok := cache[danger.MakeTypeID(t)]
+	cache, _ := globalFieldPathsCache.Load().(map[reflect.Type]fieldPathsMap)
+	fieldPaths, ok := cache[t]
 
 	if !ok {
 		fieldPaths = map[string][]int{}
@@ -1311,8 +1477,8 @@ func structFieldPath(v reflect.Value, name string) ([]int, bool) {
 			fieldPaths[strings.ToLower(name)] = path
 		})
 
-		newCache := make(map[danger.TypeID]fieldPathsMap, len(cache)+1)
-		newCache[danger.MakeTypeID(t)] = fieldPaths
+		newCache := make(map[reflect.Type]fieldPathsMap, len(cache)+1)
+		newCache[t] = fieldPaths
 		for k, v := range cache {
 			newCache[k] = v
 		}
@@ -1336,7 +1502,9 @@ func forEachField(t reflect.Type, path []int, do func(name string, path []int)) 
 			continue
 		}
 
-		fieldPath := append(path, i)
+		fieldPath := make([]int, 0, len(path)+1)
+		fieldPath = append(fieldPath, path...)
+		fieldPath = append(fieldPath, i)
 		fieldPath = fieldPath[:len(fieldPath):len(fieldPath)]
 
 		name := f.Tag.Get("toml")
